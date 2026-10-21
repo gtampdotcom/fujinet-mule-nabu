@@ -1,0 +1,228 @@
+/*
+ * boot.c -- start-up: FujiNet, who we are, which table (clients/intv/boot.bas).
+ *
+ * The FujiNet lobby hands a game its details in appkeys (creator 1, app 1):
+ *   key 0    the player's name (shared by every FujiNet game)
+ *   key 10   the table's URL, "https://host/?table=<id>"
+ * Without them we ask for a name and list the default server's tables. The
+ * chosen table is written back to key 10, so restarting rejoins it.
+ */
+#include <string.h>
+#include "mule.h"
+
+static void wait_frames(uint8_t n)
+{
+    while (n--) {
+        frame_wait();
+        snd_tick();
+    }
+}
+
+/* The name being typed, big and centred, the cursor after it. */
+#if BIGW == 2
+#define NAME_X(n)  (16 - ((n) & 0xFE))
+#define NAME_CLR_X 16           /* what a rub-out leaves */
+#define NAME_CLR_W 10
+#else
+#define NAME_X(n)  ((TCOLS - (n) - 1) / 2)
+#define NAME_CLR_X NAME_X(8)
+#define NAME_CLR_W 10
+#endif
+
+#ifdef PLAT_NO_KEYBOARD
+/* No keyboard: pick the letters. Up and down turn the one at the cursor
+ * through A-Z and 0-9 (held, it runs on); the button or right takes it and
+ * moves on, KEY_BACK or left rubs out, KEY_END ends. */
+static const char pick_set[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+static void name_entry(void)
+{
+    uint8_t n = 0, k = 0, rep = 0, blink;
+    char c;
+    gfx_clear();
+    text_center(6, "YOUR NAME?", C_WHITE);
+    text_center(16, "UP/DOWN A LETTER, " BUTTON_NAME " TAKES IT", C_WHITE);
+    text_center(18, BACK_KEY_NAME " RUBS OUT, " KEY_END_NAME " ENDS", C_WHITE);
+    memset(sc_name, 0, sizeof(sc_name));
+    for (;;) {
+        frame_wait();
+        snd_tick();
+        input_poll();
+        input_take();
+        c = ev_key;
+        if (rep)
+            --rep;
+        if ((c == KEY_BACK || (!rep && (inp_dir & DIR_LEFT))) && n) {
+            sc_name[--n] = 0;
+            rep = 12;
+            snd_play(SND_SELECT);
+        } else if (c == KEY_END) {
+            if (!n)
+                sc_name[n++] = pick_set[k];     /* a name of the one letter */
+            break;
+        } else if ((ev_btn || (!rep && (inp_dir & DIR_RIGHT))) && n < 8) {
+            sc_name[n++] = pick_set[k];
+            rep = 12;
+            snd_play(SND_SELECT);
+        } else if (!rep && (inp_dir & (DIR_UP | DIR_DOWN))) {
+            k = (inp_dir & DIR_UP) ? (k ? k - 1 : sizeof(pick_set) - 2)
+                                   : (k < sizeof(pick_set) - 2 ? k + 1 : 0);
+            rep = 8;
+        }
+        blink = (frame_count & 16) ? pick_set[k] : '_';
+        gfx_clear_text(6, 10, TCOLS - 12);
+        gfx_big(NAME_X(n), 10, sc_name, C_ORANGE);
+        if (n < 8)
+            gfx_char(NAME_X(n) + n * BIGW, 10, blink, C_WHITE);
+    }
+    snd_play(SND_SELECT);
+    appkey_save_name();
+}
+#else
+/* Type a name: A-Z and 0-9, up to 8; DELETE or <- rubs out, RETURN ends. */
+static void name_entry(void)
+{
+    uint8_t n = 0, blink;
+    char c;
+    gfx_clear();
+    text_center(6, "YOUR NAME?", C_WHITE);
+    text_center(16, "TYPE IT, THEN PRESS " KEY_END_NAME, C_WHITE);
+    memset(sc_name, 0, sizeof(sc_name));
+    for (;;) {
+        frame_wait();
+        snd_tick();
+        input_poll();
+        input_take();
+        c = ev_key;
+        if (c == KEY_BACK && n) {
+            sc_name[--n] = 0;
+            snd_play(SND_SELECT);
+        } else if (c == KEY_END && n) {
+            break;
+        } else if (n < 8 && ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+            sc_name[n++] = c;
+            snd_play(SND_SELECT);
+        }
+        blink = (frame_count & 16) ? '_' : ' ';
+        gfx_clear_text(NAME_CLR_X, 10, NAME_CLR_W);
+        gfx_big(NAME_X(n), 10, sc_name, C_ORANGE);
+        gfx_char(NAME_X(n) + n * BIGW, 10, blink, C_WHITE);
+    }
+    snd_play(SND_SELECT);
+}
+#endif
+
+#define TB_MAX 9
+#ifndef TB_EXTRA_HINT
+#define TB_EXTRA_HINT "R: REFRESH"      /* the list is fetched once, when this opens */
+#endif
+#if TCOLS == 40
+#define TB_PLAYERS_X 30         /* each table's players, after its name */
+#else
+#define TB_PLAYERS_X (TCOLS - 6)
+#endif
+static uint8_t tbuf[1 + TB_MAX * sizeof(MuleTable)];
+
+/* Choose a table from /tables: up/down, then the button (or RETURN);
+ * LEAVE quits (on the PC, back to the FujiNet lobby). */
+void table_select(void)
+{
+    uint8_t n, i, sel = 0, rep = 0;
+    MuleTable *t;
+    char name[21];
+
+    for (;;) {
+        gfx_clear();
+        big_center(0, "CHOOSE A TABLE", C_ORANGE);
+        text_center(23, "LOADING...", C_WHITE);
+        n = net_tables(tbuf, TB_MAX);
+        gfx_clear_text(0, 23, TCOLS);
+        if (n == 0) {
+            text_center(22, "NO TABLES FOUND AT", C_WHITE);
+            text_center(23, sc_endpt, C_WHITE);
+            do {
+                frame_wait();
+                input_poll();
+                input_take();
+                if (ev_key == KEY_LEAVE)
+                    plat_quit();
+            } while (!ev_btn && ev_key != KEY_END && ev_key != 'R');
+            continue;
+        }
+        t = (MuleTable *)(tbuf + 1);
+        for (i = 0; i < n; ++i) {
+            memcpy(name, t[i].name, 20);
+            name[20] = 0;
+            gfx_text(4, 4 + i * 2, name, C_WHITE);
+            memcpy(name, t[i].players, 5);
+            name[5] = 0;
+            gfx_text(TB_PLAYERS_X, 4 + i * 2, name, C_WHITE);
+        }
+        text_center(22, TB_EXTRA_HINT, C_WHITE);
+        text_center(23, "UP/DOWN, " BUTTON_NAME "   " QUIT_HINT, C_WHITE);
+        sel = 0;
+        for (;;) {
+            frame_wait();
+            snd_tick();
+            input_poll();
+            input_take();
+            for (i = 0; i < n; ++i)
+                gfx_char(2, 4 + i * 2, i == sel ? '>' : ' ', C_WHITE);
+            if (rep)
+                --rep;
+            if (!rep) {
+                if ((inp_dir & DIR_UP) && sel > 0) {
+                    --sel;
+                    rep = 12;
+                    snd_play(SND_SELECT);
+                } else if ((inp_dir & DIR_DOWN) && sel < n - 1) {
+                    ++sel;
+                    rep = 12;
+                    snd_play(SND_SELECT);
+                }
+            }
+            if (ev_btn || ev_key == KEY_END || ev_key == 'R')
+                break;
+            if (ev_key == KEY_LEAVE)
+                plat_quit();
+        }
+        if (ev_key == 'R' && !ev_btn)
+            continue;                   /* the list is fetched once: R asks again */
+        memcpy(sc_table, t[sel].iD, 8);
+        sc_table[8] = 0;
+        if (sc_table[0])
+            break;
+    }
+    snd_play(SND_SELECT);
+}
+
+/* From a game (main.c choose_table): the room we had is forgotten, then
+ * the new one is kept for next time. */
+void table_rechoose(void)
+{
+    appkey_clear_room();
+    table_select();
+    appkey_save_room();
+}
+
+#ifdef __NABU__
+extern uint8_t kb_named;                /* nabu/input.c */
+#endif
+
+void boot(void)
+{
+    text_center(16, "CONNECTING...", C_WHITE);
+    while (!net_detect()) {
+        text_center(16, "NO FUJINET FOUND", C_WHITE);
+        wait_frames(60);
+    }
+    appkey_load();
+    if (!sc_name[0])
+        name_entry();
+#ifdef __NABU__
+    kb_named = 1;                       /* M is the music's from here on */
+#endif
+    if (!sc_table[0])
+        table_select();
+    appkey_save_room();
+}
