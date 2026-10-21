@@ -1,8 +1,10 @@
 # M.U.L.E. for the NABU PC
 
 A port of the FujiNet multiplayer M.U.L.E. client to the NABU PC (Z80, TMS9918A, AY-3-8910).
-It plays on a tournament server (the default is http://fujinet.online:9900) through the
+It plays on a tournament server (the default is fujinet.online:9900) through the
 NABU Internet Adapter's RetroNET TCP, and boots as a `.nabu` file.
+
+If you just want to play it, instructions are here: https://nabu.ca/software/185
 
 The game logic (`src/*.c`) and the screen (`src/tms9918/`) are shared with the other
 FujiNet M.U.L.E. clients (the MSX one in particular). `src/nabu/` is the NABU's part: the
